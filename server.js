@@ -30,6 +30,49 @@ if (!GEMINI_API_KEY) {
 const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 
+// Config valori implicite (se pot ajusta prin variabile de mediu)
+const MAX_RADIUS_METERS = 20000; // 20km hard cap
+const SEARCH_RADII = [4000, 8000, 12000, 20000];
+const PAGE_LIMIT_PER_QUERY = 3; // maxim 3 pagini (Nearby/Search API)
+const HARD_RESULT_LIMIT = 40; // nu întoarcem mai mult
+const MIN_RATING = parseFloat(process.env.MIN_RATING || '3.5');
+const MIN_REVIEWS = parseInt(process.env.MIN_REVIEWS || '5', 10);
+
+// Mapare categorie -> Google Place types (extensibilă)
+const CATEGORY_TYPE_MAP = {
+	'hotel': ['lodging'],
+	'cazare': ['lodging'],
+	'restaurant': ['restaurant'],
+	'cafenea': ['cafe'],
+	'cafea': ['cafe'],
+	'bar': ['bar'],
+	'pub': ['bar'],
+	'farmacie': ['pharmacy'],
+	'medical': ['doctor','hospital'],
+	'spital': ['hospital'],
+	'dentist': ['dentist'],
+	'service auto': ['car_repair'],
+	'auto': ['car_repair'],
+	'benzinarie': ['gas_station'],
+	'salon': ['beauty_salon','hair_care'],
+	'frizerie': ['hair_care','beauty_salon'],
+	'cosmetica': ['beauty_salon'],
+	'spa': ['spa'],
+	'florarie': ['florist'],
+	'supermarket': ['supermarket','grocery_or_supermarket'],
+	'magazin': ['store'],
+	'banca': ['bank'],
+	'atm': ['atm'],
+	'parcare': ['parking'],
+	'gradinita': ['school'],
+	'scoala': ['school'],
+	'universitate': ['university'],
+};
+
+function normalizedCategory(cat){
+	return (cat||'').toLowerCase().trim();
+}
+
 // Shared schemas (keep minimal subset – not importing TS types to keep server.js plain JS)
 const marketResearchSchema = {
 	type: Type.OBJECT,
@@ -126,90 +169,119 @@ app.post('/api/market-research', async (req, res) => {
 });
 
 app.post('/api/local-services', async (req, res) => {
-	const { category, coords } = req.body || {};
+	const { category, coords, openNow } = req.body || {};
 	if (!category) return buildError(res, 'Câmpul category este obligatoriu.', 400);
-	// Nou: obligatoriu coordonate pentru a afișa DOAR rezultate locale (max 20km)
 	if (!coords?.latitude || !coords?.longitude) {
 		return buildError(res, 'Trebuie să permiți locația pentru a obține servicii locale (rază 20 km).', 400);
 	}
 
-	// If Google Places key is available, fetch real data first (broader, more forgiving logic for always-return)
-	if (GOOGLE_PLACES_API_KEY) {
-		const debugLog = (...args) => {
-			// Minimal log noise – helps debug “rămâne pe loading” situații
-			console.log('[local-services]', ...args);
-		};
-		try {
-			let listings = [];
-			// Nearby search cu raze progresive până la 20km (5000 / 10000 / 20000)
-			const radii = [5000, 10000, 20000];
-			for (const r of radii) {
-				const nearbyUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${coords.latitude},${coords.longitude}&radius=${r}&keyword=${encodeURIComponent(category)}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
-				const nearbyResp = await fetch(nearbyUrl);
-				const nearbyJson = await nearbyResp.json();
-				debugLog('nearby radius', r, 'status', nearbyJson.status, 'results', nearbyJson.results?.length || 0);
-				listings.push(...(nearbyJson.results || []).map(p => mapPlace(p, category)));
-				if (listings.length >= 20) break; // suficient
-			}
+	const debugLog = (...a) => console.log('[local-services]', ...a);
+	const catNorm = normalizedCategory(category);
+	const mappedTypes = CATEGORY_TYPE_MAP[catNorm] || [];
+	const keywords = [catNorm]; // se pot adăuga sinonime viitor
 
-			// Dacă după 20km nu avem rezultate deloc → returnăm mesaj clar fără a căuta în toată țara
-			if (listings.length === 0) {
+	async function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+	async function fetchNearbyPaged({ lat, lng, radius, keyword, type }){
+		const accum = [];
+		let pageToken = null;
+		for (let page=0; page < PAGE_LIMIT_PER_QUERY; page++) {
+			const base = new URL('https://maps.googleapis.com/maps/api/place/nearbysearch/json');
+			base.searchParams.set('location', `${lat},${lng}`);
+			base.searchParams.set('radius', radius.toString());
+			base.searchParams.set('language', 'ro');
+			if (openNow) base.searchParams.set('opennow','true');
+			if (keyword) base.searchParams.set('keyword', keyword);
+			if (type) base.searchParams.set('type', type);
+			base.searchParams.set('key', GOOGLE_PLACES_API_KEY);
+			if (pageToken) base.searchParams.set('pagetoken', pageToken);
+			const url = base.toString();
+			const resp = await fetch(url);
+			const json = await resp.json();
+			debugLog('nearby', { radius, type, keyword, status: json.status, got: json.results?.length || 0, page });
+			if (json.results) accum.push(...json.results.map(r=>mapPlace(r, category)));
+			if (!json.next_page_token) break;
+			pageToken = json.next_page_token;
+			await delay(1600); // necesar pentru activarea token-ului
+		}
+		return accum;
+	}
+
+	function deduplicateAndFilter(list){
+		const byId = new Map();
+		for (const l of list){
+			// distanță + rating filter preliminar (dar păstrăm câteva dacă nu avem nimic)
+			byId.set(l.place_id, l);
+		}
+		let arr = Array.from(byId.values());
+		// Calculează distanța & elimină >20km
+		arr.forEach(l=>{ if (l.coords) l.distance = haversineKm(coords.latitude, coords.longitude, l.coords.latitude, l.coords.longitude); });
+		arr = arr.filter(l => l.distance == null || l.distance <= (MAX_RADIUS_METERS/1000));
+		// Filtre rating / reviews, dar doar dacă avem suficient volum
+		const prelim = arr.filter(l => (l.rating ?? 0) >= MIN_RATING && (l.user_ratings_total ?? 0) >= MIN_REVIEWS);
+		if (prelim.length >= 8) arr = prelim; // altfel păstrăm și pe cele slabe
+		// Sort principal: distanță, rating, reviews
+		arr.sort((a,b)=>{
+			const da = a.distance ?? 1e9; const db = b.distance ?? 1e9; if (da!==db) return da-db;
+			const rdiff = (b.rating??0) - (a.rating??0); if (rdiff) return rdiff;
+			return (b.user_ratings_total??0) - (a.user_ratings_total??0);
+		});
+		return arr.slice(0, HARD_RESULT_LIMIT);
+	}
+
+	let collected = [];
+
+	if (GOOGLE_PLACES_API_KEY){
+		try {
+			for (const radius of SEARCH_RADII){
+				// Queries by mapped types (more precise)
+				for (const t of mappedTypes){
+					const batch = await fetchNearbyPaged({ lat: coords.latitude, lng: coords.longitude, radius, type: t });
+					collected.push(...batch);
+				}
+				// Keyword based (fallback)
+				for (const kw of keywords){
+					const batch = await fetchNearbyPaged({ lat: coords.latitude, lng: coords.longitude, radius, keyword: kw });
+					collected.push(...batch);
+				}
+				collected = deduplicateAndFilter(collected);
+				debugLog('after radius', radius, 'unique', collected.length);
+				if (collected.length >= 25) break; // destule rezultate
+			}
+			if (collected.length === 0){
 				return res.json({ listings: [] });
 			}
-
-			// Deduplicate
-			const dedupMap = {};
-			for (const l of listings) { if (!dedupMap[l.place_id]) dedupMap[l.place_id] = l; }
-			let dedup = Object.values(dedupMap);
-
-			// Compute distance if coords provided (no hard filtering now to keep more results visible)
-			if (coords?.latitude && coords?.longitude) {
-				dedup.forEach(l => { if (l.coords) l.distance = haversineKm(coords.latitude, coords.longitude, l.coords.latitude, l.coords.longitude); });
-			}
-
-			// Sort: prioritize distance (if available) then rating then reviews
-			dedup.sort((a,b) => {
-				if (coords?.latitude && coords?.longitude) {
-					const da = a.distance ?? 1e9; const db = b.distance ?? 1e9; if (da !== db) return da - db;
-				}
-				const rdiff = (b.rating ?? 0) - (a.rating ?? 0); if (rdiff) return rdiff;
-				return (b.user_ratings_total ?? 0) - (a.user_ratings_total ?? 0);
-			});
-
-			// AI enrichment opțional păstrat doar pentru scurte rezumate (nu generăm liste fictive, păstrăm real local)
-			if (ai) {
-				try {
-					for (const l of dedup.slice(0,12)) {
-						if (!l.editorial_summary) {
-							try {
-								const r = await ai.models.generateContent({
-									model: 'gemini-2.5-flash',
-									contents: `Frază scurtă (max 14 cuvinte) despre ${l.name} (${l.vicinity}). Ton obiectiv.` ,
-									config: { responseMimeType: 'text/plain', thinkingConfig: { thinkingBudget: 0 } }
-								});
-								l.editorial_summary = (r.text||'').trim();
-							} catch {}
-						}
+			// AI enrichment (scurt) pe primele 12
+			if (ai){
+				for (const l of collected.slice(0,12)){
+					if (!l.editorial_summary){
+						try {
+							const r = await ai.models.generateContent({
+								model: 'gemini-2.5-flash',
+								contents: `Frază scurtă (max 14 cuvinte) despre ${l.name} (${l.vicinity}). Ton obiectiv.`,
+								config: { responseMimeType: 'text/plain', thinkingConfig: { thinkingBudget: 0 } }
+							});
+							l.editorial_summary = (r.text||'').trim();
+						} catch {}
 					}
-				} catch(e) { /* ignore enrichment errors */ }
+				}
 			}
-
-			debugLog('final dedup listings', dedup.length);
-			return res.json({ listings: dedup });
-		} catch (e) {
-			console.error('Google Places fetch error', e);
-			// continue to AI fallback below
+			debugLog('final listings', collected.length);
+			return res.json({ listings: collected });
+		} catch (e){
+			console.error('Google Places refined fetch error', e);
+			// continuăm spre fallback AI
 		}
 	}
 
-	// AI fallback – limitat la 20km, doar dacă există AI (dacă nu, mesaj clar)
-	if (!ai) return buildError(res, 'Nu s-au găsit rezultate reale și AI indisponibil pentru generare locală.', 500);
-	const constraintPrompt = `Generează afaceri locale (max 15) pentru categoria "${category}" în jurul coordonatelor ${JSON.stringify(coords)}.
-	Reguli:
-	- Toate coordonatele la <20 km de utilizator.
-	- rating 3.5-5.0, user_ratings_total 10-50000.
-	- Fără dubluri.
-	- JSON strict conform schemei.`;
+	// Fallback AI dacă nu avem cheie sau a eșuat apelul real
+	if (!ai) return buildError(res, 'Nu s-au găsit rezultate reale și AI indisponibil.', 500);
+	const constraintPrompt = `Generează până la 15 afaceri locale reale/plauzibile pentru categoria "${category}" în jurul coordonatelor ${JSON.stringify(coords)}.
+Reguli:
+- Toate coordonatele <20 km.
+- rating 3.5-5.0, user_ratings_total 10-50000.
+- Fără dubluri, JSON conform schemei.
+Returnează doar JSON.`;
 	try {
 		const response = await ai.models.generateContent({
 			model: 'gemini-2.5-flash',
@@ -219,13 +291,10 @@ app.post('/api/local-services', async (req, res) => {
 		const text = response.text.trim();
 		if (!text) return buildError(res, 'Răspuns gol de la AI');
 		const json = JSON.parse(text);
-		// Distance filtering client side remains, but we can discard weird far points (>400km) if user coords
-		if (coords?.latitude && coords?.longitude) {
-			json.listings = (json.listings||[]).filter(l => l.coords && withinRomania(l.coords) &&
-				haversineKm(coords.latitude, coords.longitude, l.coords.latitude, l.coords.longitude) <= 400);
-		}
+		json.listings = (json.listings||[]).filter(l => l.coords && withinRomania(l.coords) &&
+			haversineKm(coords.latitude, coords.longitude, l.coords.latitude, l.coords.longitude) <= (MAX_RADIUS_METERS/1000));
 		return res.json(json);
-	} catch (e) {
+	} catch (e){
 		console.error('AI fallback error', e);
 		return buildError(res, 'Eroare la generarea fallback AI.');
 	}
