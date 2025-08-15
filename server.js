@@ -128,44 +128,33 @@ app.post('/api/market-research', async (req, res) => {
 app.post('/api/local-services', async (req, res) => {
 	const { category, coords } = req.body || {};
 	if (!category) return buildError(res, 'Câmpul category este obligatoriu.', 400);
+	// Nou: obligatoriu coordonate pentru a afișa DOAR rezultate locale (max 20km)
+	if (!coords?.latitude || !coords?.longitude) {
+		return buildError(res, 'Trebuie să permiți locația pentru a obține servicii locale (rază 20 km).', 400);
+	}
 
 	// If Google Places key is available, fetch real data first (broader, more forgiving logic for always-return)
 	if (GOOGLE_PLACES_API_KEY) {
+		const debugLog = (...args) => {
+			// Minimal log noise – helps debug “rămâne pe loading” situații
+			console.log('[local-services]', ...args);
+		};
 		try {
 			let listings = [];
-			// 1. Nearby search with progressive radius expansion if user coords present
-			if (coords?.latitude && coords?.longitude) {
-				const radii = [5000, 10000, 20000, 35000];
-				for (const r of radii) {
-					const nearbyUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${coords.latitude},${coords.longitude}&radius=${r}&keyword=${encodeURIComponent(category)}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
-					const nearbyResp = await fetch(nearbyUrl);
-					const nearbyJson = await nearbyResp.json();
-					listings.push(...(nearbyJson.results || []).map(p => mapPlace(p, category)));
-					if (listings.length >= 8) break; // enough local hits
-				}
+			// Nearby search cu raze progresive până la 20km (5000 / 10000 / 20000)
+			const radii = [5000, 10000, 20000];
+			for (const r of radii) {
+				const nearbyUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${coords.latitude},${coords.longitude}&radius=${r}&keyword=${encodeURIComponent(category)}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
+				const nearbyResp = await fetch(nearbyUrl);
+				const nearbyJson = await nearbyResp.json();
+				debugLog('nearby radius', r, 'status', nearbyJson.status, 'results', nearbyJson.results?.length || 0);
+				listings.push(...(nearbyJson.results || []).map(p => mapPlace(p, category)));
+				if (listings.length >= 20) break; // suficient
 			}
 
-			// 2. If still few, run text searches across major + secondary cities (ensures content for homepage "top")
-			if (listings.length < 12) {
-				const cities = [
-					'Bucuresti','Cluj-Napoca','Timisoara','Iasi','Constanta','Brasov','Sibiu','Oradea','Craiova','Pitesti','Arad','Targu Mures'
-				];
-				for (const city of cities) {
-					const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(category + ' in ' + city + ', Romania')}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
-					const resp = await fetch(url);
-					const data = await resp.json();
-					const mapped = (data.results || []).slice(0, 4).map(r => mapPlace(r, category));
-					listings.push(...mapped);
-					if (listings.length >= 40) break; // cap to avoid overload
-				}
-			}
-
-			// 3. If still empty, do a Romania-wide generic text search
+			// Dacă după 20km nu avem rezultate deloc → returnăm mesaj clar fără a căuta în toată țara
 			if (listings.length === 0) {
-				const nationalUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(category + ' Romania')}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
-				const nationalResp = await fetch(nationalUrl);
-				const nationalJson = await nationalResp.json();
-				listings = (nationalJson.results || []).map(r => mapPlace(r, category));
+				return res.json({ listings: [] });
 			}
 
 			// Deduplicate
@@ -187,25 +176,9 @@ app.post('/api/local-services', async (req, res) => {
 				return (b.user_ratings_total ?? 0) - (a.user_ratings_total ?? 0);
 			});
 
-			// 4. AI enrichment OR (if still very few) AI synthetic fillers to reach a minimum
+			// AI enrichment opțional păstrat doar pentru scurte rezumate (nu generăm liste fictive, păstrăm real local)
 			if (ai) {
 				try {
-					if (dedup.length < 6) {
-						// generate synthetic fillers (clearly flagged in editorial_summary)
-						const fillerPrompt = `Generează 5 afaceri plauzibile din România pentru categoria "${category}" (JSON conform schemei) cu câmp editorial_summary care începe cu '[Sugerat]'.`;
-						const resp = await ai.models.generateContent({
-							model: 'gemini-2.5-flash',
-							contents: fillerPrompt,
-							config: { responseMimeType: 'application/json', responseSchema: localServicesSchema, thinkingConfig: { thinkingBudget: 0 } }
-						});
-						const txt = (resp.text||'').trim();
-						if (txt) {
-							const json = JSON.parse(txt);
-							json.listings.forEach(l => { if (!dedupMap[l.place_id]) { dedupMap[l.place_id] = l; } });
-							dedup = Object.values(dedupMap);
-						}
-					}
-					// Short summaries for first 12 real listings without summary
 					for (const l of dedup.slice(0,12)) {
 						if (!l.editorial_summary) {
 							try {
@@ -218,9 +191,10 @@ app.post('/api/local-services', async (req, res) => {
 							} catch {}
 						}
 					}
-				} catch(e) { /* enrichment non-critical */ }
+				} catch(e) { /* ignore enrichment errors */ }
 			}
 
+			debugLog('final dedup listings', dedup.length);
 			return res.json({ listings: dedup });
 		} catch (e) {
 			console.error('Google Places fetch error', e);
@@ -228,15 +202,14 @@ app.post('/api/local-services', async (req, res) => {
 		}
 	}
 
-	// AI fallback (less reliable). Constrain coordinates to Romania bounding box.
-	if (!ai) return buildError(res, 'Nu există date reale (fără Google Places) și AI indisponibil.');
-	const constraintPrompt = `Generează liste de afaceri locale reale-plauzibile în România pentru categoria "${category}".
-	Reguli stricte:
-	- Dacă se furnizează coordonate utilizator (${coords?JSON.stringify(coords):'none'}), pune primele rezultate la <25 km.
-	- Coordonatele trebuie să fie în interiorul României (lat 43.6-48.3, lon 20.2-29.7).
-	- rating între 3.5 și 5.0; user_ratings_total între 10 și 50000.
+	// AI fallback – limitat la 20km, doar dacă există AI (dacă nu, mesaj clar)
+	if (!ai) return buildError(res, 'Nu s-au găsit rezultate reale și AI indisponibil pentru generare locală.', 500);
+	const constraintPrompt = `Generează afaceri locale (max 15) pentru categoria "${category}" în jurul coordonatelor ${JSON.stringify(coords)}.
+	Reguli:
+	- Toate coordonatele la <20 km de utilizator.
+	- rating 3.5-5.0, user_ratings_total 10-50000.
 	- Fără dubluri.
-	Output STRICT JSON conform schemei.`;
+	- JSON strict conform schemei.`;
 	try {
 		const response = await ai.models.generateContent({
 			model: 'gemini-2.5-flash',
