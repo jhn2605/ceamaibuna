@@ -67,6 +67,21 @@ const CATEGORY_TYPE_MAP = {
 	'gradinita': ['school'],
 	'scoala': ['school'],
 	'universitate': ['university'],
+	'service it': ['electronics_store','store'],
+};
+
+// Sinonime / fraze alternative pentru cuvinte cheie suplimentare
+const CATEGORY_SYNONYMS = {
+	'service it': [
+		'service calculatoare','reparatii laptop','reparatii calculatoare',
+		'service laptop','reparatii pc','it service','service pc','reparatii notebook'
+	],
+	'restaurant': ['mancare','bistro','trattoria'],
+	'cafenea': ['coffee','coffee shop','cafea'],
+	'farmacie': ['medicamente','pharmacy'],
+	'dentist': ['stomatolog','cabinet stomatologic'],
+	'frizerie': ['barber','barbier','coafor'],
+	'cosmetica': ['beauty','beauty salon','infrumusetare'],
 };
 
 function normalizedCategory(cat){
@@ -178,7 +193,11 @@ app.post('/api/local-services', async (req, res) => {
 	const debugLog = (...a) => console.log('[local-services]', ...a);
 	const catNorm = normalizedCategory(category);
 	const mappedTypes = CATEGORY_TYPE_MAP[catNorm] || [];
-	const keywords = [catNorm]; // se pot adăuga sinonime viitor
+	// Expandare din sinonime și cuvinte separate
+	const keywordsSet = new Set([catNorm]);
+	(CATEGORY_SYNONYMS[catNorm]||[]).forEach(k=>keywordsSet.add(k));
+	catNorm.split(/\s+/).forEach(w=>keywordsSet.add(w));
+	const keywords = Array.from(keywordsSet);
 
 	async function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
@@ -247,6 +266,26 @@ app.post('/api/local-services', async (req, res) => {
 				collected = deduplicateAndFilter(collected);
 				debugLog('after radius', radius, 'unique', collected.length);
 				if (collected.length >= 25) break; // destule rezultate
+			}
+			// Fallback suplimentar dacă 0 rezultate: încercare generică cu types largi și cuvinte individuale
+			if (collected.length === 0) {
+				debugLog('no results after standard search, starting broad fallback');
+				const genericTypes = ['electronics_store','store','point_of_interest','establishment'];
+				const broadKeywords = new Set([...keywords, ...catNorm.split(/\s+/), 'service','it','laptop','pc']);
+				for (const t of genericTypes){
+					const batch = await fetchNearbyPaged({ lat: coords.latitude, lng: coords.longitude, radius: MAX_RADIUS_METERS, type: t });
+					collected.push(...batch);
+					collected = deduplicateAndFilter(collected);
+					if (collected.length >= 10) break;
+				}
+				if (collected.length < 5){
+					for (const kw of broadKeywords){
+						const batch = await fetchNearbyPaged({ lat: coords.latitude, lng: coords.longitude, radius: MAX_RADIUS_METERS, keyword: kw });
+						collected.push(...batch);
+						collected = deduplicateAndFilter(collected);
+						if (collected.length >= 12) break;
+					}
+				}
 			}
 			if (collected.length === 0){
 				return res.json({ listings: [] });
