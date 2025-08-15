@@ -133,6 +133,23 @@ app.post('/api/local-services', async (req, res) => {
 		return buildError(res, 'Trebuie să permiți locația pentru a obține servicii locale (rază 20 km).', 400);
 	}
 
+	// Dicționar sinonime / alias-uri pentru categorii mai puțin standard (extensibil ușor)
+	const CATEGORY_ALIASES = {
+		'service it': [
+			' service IT', 'service IT', 'service calculatoare', 'service laptop', 'reparatii laptop', 'reparatii calculatoare', 'repair computer', 'computer service'
+		],
+		'frizerie': ['frizerie', 'coafor', 'barber', 'barbershop'],
+		'dentist': ['dentist', 'stomatolog', 'cabinet stomatologic']
+	};
+	// Normalizare categorie pentru lookup (lowercase, fără diacritice simple)
+	const norm = (s)=> s.toLowerCase().normalize('NFD').replace(/[^\w\s]/g,'').replace(/\s+/g,' ').trim();
+	const catKey = norm(category);
+	let keywords = [category]; // păstrăm input original primul
+	if (CATEGORY_ALIASES[catKey]) {
+		// păstrăm ordine: original -> alias-uri
+		CATEGORY_ALIASES[catKey].forEach(a=>{ if(!keywords.includes(a)) keywords.push(a); });
+	}
+
 	// If Google Places key is available, fetch real data first (broader, more forgiving logic for always-return)
 	if (GOOGLE_PLACES_API_KEY) {
 		const debugLog = (...args) => {
@@ -141,18 +158,32 @@ app.post('/api/local-services', async (req, res) => {
 		};
 		try {
 			let listings = [];
-			// Nearby search cu raze progresive până la 20km (5000 / 10000 / 20000)
+			// Nearby search cu raze progresive și mai multe cuvinte cheie (alias-uri) până la 20km
 			const radii = [5000, 10000, 20000];
-			for (const r of radii) {
-				const nearbyUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${coords.latitude},${coords.longitude}&radius=${r}&keyword=${encodeURIComponent(category)}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
-				const nearbyResp = await fetch(nearbyUrl);
-				const nearbyJson = await nearbyResp.json();
-				debugLog('nearby radius', r, 'status', nearbyJson.status, 'results', nearbyJson.results?.length || 0);
-				listings.push(...(nearbyJson.results || []).map(p => mapPlace(p, category)));
-				if (listings.length >= 20) break; // suficient
+			let firstErrorStatus = null;
+			for (const kw of keywords) {
+				for (const r of radii) {
+					const nearbyUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${coords.latitude},${coords.longitude}&radius=${r}&keyword=${encodeURIComponent(kw)}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
+					const nearbyResp = await fetch(nearbyUrl);
+					const nearbyJson = await nearbyResp.json();
+					debugLog('kw', kw, 'radius', r, 'status', nearbyJson.status, 'results', nearbyJson.results?.length || 0);
+					if (nearbyJson.status && !['OK','ZERO_RESULTS'].includes(nearbyJson.status)) {
+						if (!firstErrorStatus) firstErrorStatus = { status: nearbyJson.status, message: nearbyJson.error_message };
+						// Trecem la următorul keyword dacă status e fatal (REQUEST_DENIED etc.)
+						if (['REQUEST_DENIED','INVALID_REQUEST'].includes(nearbyJson.status)) break;
+					}
+					listings.push(...(nearbyJson.results || []).map(p => ({ ...mapPlace(p, category), _kw: kw })));
+					if (listings.length >= 25) break; // suficient
+				}
+				if (listings.length >= 25) break;
 			}
 
-			// Dacă după 20km nu avem rezultate deloc → returnăm mesaj clar fără a căuta în toată țara
+			// Dacă nu am găsit nimic și există un status de eroare de la API, îl returnăm explicit
+			if (listings.length === 0 && firstErrorStatus) {
+				return buildError(res, `Google Places error: ${firstErrorStatus.status}${firstErrorStatus.message ? ' - ' + firstErrorStatus.message : ''}`, 502);
+			}
+
+			// Dacă după toate alias-urile nu avem rezultate → returnăm listă goală (UI va afișa mesaj)
 			if (listings.length === 0) {
 				return res.json({ listings: [] });
 			}
