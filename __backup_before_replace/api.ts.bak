@@ -1,0 +1,9 @@
+BACKUP ORIGINAL api.ts
+
+import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
+import { type MarketResearchResult, type GooglePlaceListing, type Coords, type Review } from "./types";
+import { isCoordsInRomania } from './utils';
+
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+
+// (Original content backed up automatically.)

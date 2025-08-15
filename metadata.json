@@ -1,0 +1,8 @@
+{
+  "name": "Copy 1111111111111of 11Aproape gata CeAmaiBuna.ro - Local Services Directory",
+  "description": "A platform to find, review, and compare the best local services and products in Romania. Discover top-rated restaurants, auto shops, beauty salons, and more.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "prompt": ""
+}

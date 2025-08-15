@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ro-RO">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CeAmaiBuna.ro - Găsește cele mai bune servicii</title>
+    <meta name="theme-color" content="#ef4444">
+    
+    <!-- SEO Meta Tags -->
+    <meta name="description" content="Găsește și evaluează cele mai bune servicii și produse din România. Recenzii verificate pentru restaurante, service-uri auto, saloane și multe altele pe CeAmaiBuna.ro." />
+    <meta name="keywords" content="recenzii, servicii, produse, romania, restaurante, service auto, saloane, cel mai bun, local" />
+    <link rel="canonical" href="https://www.ceamaibuna.ro/" />
+
+    <!-- Schema.org Markup for Google -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "name": "CeAmaiBuna.ro",
+      "url": "https://www.ceamaibuna.ro/",
+      "logo": "https://www.ceamaibuna.ro/logo.png",
+      "contactPoint": {
+        "@type": "ContactPoint",
+        "telephone": "+40-XXX-XXX-XXX",
+        "contactType": "customer service"
+      },
+      "sameAs": [
+        "https://www.facebook.com/ceamaibuna",
+        "https://www.twitter.com/ceamaibuna",
+        "https://www.instagram.com/ceamaibuna"
+      ]
+    }
+    </script>
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebSite",
+      "url": "https://www.ceamaibuna.ro/",
+      "potentialAction": {
+        "@type": "SearchAction",
+        "target": {
+          "@type": "EntryPoint",
+          "urlTemplate": "https://www.ceamaibuna.ro/search?q={search_term_string}"
+        },
+        "query-input": "required name=search_term_string"
+      }
+    }
+    </script>
+
+  <!-- Tailwind CSS is now built locally via PostCSS (see tailwind.config.js) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    
+    <!-- Leaflet Map Library -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://esm.sh/react-dom@^19.1.1/",
+    "react/": "https://esm.sh/react@^19.1.1/",
+    "react": "https://esm.sh/react@^19.1.1",
+    "@google/genai": "https://esm.sh/@google/genai"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body class="bg-brand-light dark:bg-gray-900">
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
