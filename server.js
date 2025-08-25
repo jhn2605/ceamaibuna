@@ -1,71 +1,371 @@
+// Endpoint pentru autocomplete business (proxy Google Places v1)
+app.post('/api/places-autocomplete', async (req, res) => {
+	if (!GOOGLE_PLACES_API_KEY) {
+		return buildError(res, 'Cheia Google Places lipsește din env.', 500);
+	}
+	const { input, locationBias, includedPrimaryTypes } = req.body || {};
+	if (!input) return buildError(res, 'Câmpul input este obligatoriu.', 400);
+
+	// Construim payload conform API v1
+	const payload = {
+		input,
+		languageCode: 'ro',
+		// locationBias: { circle: { center: { latitude, longitude }, radius } }
+		...(locationBias ? { locationBias } : {}),
+		...(includedPrimaryTypes ? { includedPrimaryTypes } : { includedPrimaryTypes: ['establishment'] })
+	};
+
+	try {
+		const resp = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Goog-Api-Key': GOOGLE_PLACES_API_KEY,
+				'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.id,places.types,places.location',
+			},
+			body: JSON.stringify(payload)
+		});
+		const data = await resp.json();
+		if (!resp.ok) {
+			return buildError(res, data.error?.message || 'Eroare la Google Places', resp.status);
+		}
+		return res.json(data);
+	} catch (e) {
+		console.error('Eroare la autocomplete Google Places', e);
+		return buildError(res, 'Eroare server la autocomplete.');
+	}
+});
 import express from 'express';
 import cors from 'cors';
+import { GoogleGenAI, Type } from '@google/genai';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import fetch from 'node-fetch';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// ESM equivalent pentru __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load environment variables (prefer .env.local if present, else fallback to .env)
+if (fs.existsSync('.env.local')) {
+	dotenv.config({ path: '.env.local' });
+} else {
+	dotenv.config();
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-import { performMarketResearch } from './aiMarketResearch.js';
-// Endpoint AI pentru studiu de piață
-app.post('/api/ai-market-research', async (req, res) => {
-	const { query, location, coords } = req.body || {};
-	if (!query) return res.status(400).json({ error: 'Câmpul query este obligatoriu.' });
-	try {
-		const result = await performMarketResearch(query, location, coords);
-		return res.json(result);
-	} catch (e) {
-		return res.status(500).json({ error: e.message || 'Eroare AI.' });
-	}
-});
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.API_KEY;
+if (!GEMINI_API_KEY) {
+	console.warn('[AI] Missing GEMINI_API_KEY in environment. Endpoints will return 500.');
+}
 
-// Endpoint dummy pentru AdsBox (cu reclame/prețuri vechi)
-app.get('/ads', (req, res) => {
-	// Structură compatibilă cu AdsBox.tsx
-	res.json([
-		{
-			businessUrl: 'https://www.emag.ro/samsung-galaxy-s22',
-			duration: '30',
-			createdAt: '2024-08-01',
-			status: 'active',
-			userId: 'emag-1'
-		},
-		{
-			businessUrl: 'https://altex.ro/iphone-13',
-			duration: '14',
-			createdAt: '2024-07-20',
-			status: 'active',
-			userId: 'altex-2'
-		},
-		{
-			businessUrl: 'https://pcgarage.ro/laptop-lenovo-ideapad-3',
-			duration: '7',
-			createdAt: '2024-08-15',
-			status: 'active',
-			userId: 'pcg-3'
-		}
-	]);
-});
+const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 
-// Dummy fallback pentru prețuri reale, doar cu magazine din România și prețuri în lei
-function buildMarketFallback(query) {
-	const base = query.slice(0, 1).toUpperCase() + query.slice(1);
-	const randomPrice = () => `${Math.floor(Math.random() * 2000) + 1000} RON`;
+// Shared schemas (keep minimal subset – not importing TS types to keep server.js plain JS)
+const marketResearchSchema = {
+	type: Type.OBJECT,
+	properties: {
+		categorySummary: { type: Type.STRING },
+		marketStudy: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { productName: { type: Type.STRING }, summary: { type: Type.STRING }, pros: { type: Type.ARRAY, items: { type: Type.STRING } }, cons: { type: Type.ARRAY, items: { type: Type.STRING } }, prices: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { source: { type: Type.STRING }, price: { type: Type.STRING } }, required: ['source','price'] } } }, required: ['productName','summary','pros','cons','prices'] } }
+	},
+	required: ['categorySummary','marketStudy']
+};
+
+const localServicesSchema = {
+	type: Type.OBJECT,
+	properties: { listings: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { place_id: { type: Type.STRING }, name: { type: Type.STRING }, category: { type: Type.STRING }, types: { type: Type.ARRAY, items: { type: Type.STRING } }, vicinity: { type: Type.STRING }, rating: { type: Type.NUMBER }, user_ratings_total: { type: Type.NUMBER }, coords: { type: Type.OBJECT, properties: { latitude: { type: Type.NUMBER }, longitude: { type: Type.NUMBER } } }, url: { type: Type.STRING }, website: { type: Type.STRING }, phone_number: { type: Type.STRING }, opening_hours: { type: Type.STRING }, detailed_opening_hours: { type: Type.ARRAY, items: { type: Type.STRING } }, business_status: { type: Type.STRING }, price_level: { type: Type.NUMBER }, editorial_summary: { type: Type.STRING } }, required: ['place_id','name','vicinity','rating','user_ratings_total'] } } },
+	required: ['listings']
+};
+
+const googleReviewsSchema = {
+	type: Type.OBJECT,
+	properties: { reviews: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { author: { type: Type.STRING }, text: { type: Type.STRING }, rating: { type: Type.NUMBER } }, required: ['author','text','rating'] } } },
+	required: ['reviews']
+};
+
+function buildError(res, message, status = 500) {
+	return res.status(status).json({ error: message });
+}
+
+// Lightweight deterministic fallback (used if AI key missing or AI call fails)
+function buildMarketFallback(query){
+	const base = query.slice(0,1).toUpperCase() + query.slice(1);
 	const sample = [
 		{
-			productName: `${base}`,
-			summary: `Ofertă reală pentru ${base} de la magazine din România.`,
-			pros: ['Preț bun', 'Disponibilitate rapidă', 'Garanție inclusă'],
-			cons: ['Stoc limitat', 'Preț variabil în funcție de sezon'],
+			productName: `${base} Model A`,
+			summary: `Variantă de bază pentru ${base}, evidențiază raport preț / valoare și fiabilitate corectă.`,
+			pros: ['Preț accesibil', 'Consum redus', 'Disponibil pe scară largă'],
+			cons: ['Funcții avansate limitate', 'Materiale medii'],
 			prices: [
-				{ source: 'eMAG', price: randomPrice() },
-				{ source: 'Altex', price: randomPrice() },
-				{ source: 'PC Garage', price: randomPrice() },
-				{ source: 'Vola', price: randomPrice() }
+				{ source: 'eMAG', price: '499 RON' },
+				{ source: 'Altex', price: '515 RON' }
+			]
+		},
+		{
+			productName: `${base} Pro`,
+			summary: `Versiune orientată pe performanță cu specificații superioare și finisaj premium.`,
+			pros: ['Performanță rapidă', 'Construcție solidă', 'Caracteristici suplimentare'],
+			cons: ['Preț mai ridicat', 'Autonomie moderată'],
+			prices: [
+				{ source: 'eMAG', price: '899 RON' },
+				{ source: 'PC Garage', price: '879 RON' }
+			]
+		},
+		{
+			productName: `${base} Ultra`,
+			summary: `Gama superioară pentru ${base} cu accent pe longevitate și componente de top.`,
+			pros: ['Cele mai bune performanțe', 'Durată de viață extinsă', 'Set complet de funcții'],
+			cons: ['Cost foarte ridicat', 'Disponibilitate limitată'],
+			prices: [
+				{ source: 'Altex', price: '1299 RON' }
 			]
 		}
 	];
-	return { categorySummary: `Rezultate demonstrative pentru interogarea "${query}" (dummy local).`, marketStudy: sample };
+	return { categorySummary: `Rezultate demonstrative pentru interogarea "${query}" (fallback local – AI indisponibil).`, marketStudy: sample };
 }
 
-const PORT = process.env.PORT || 5175;
-app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
+app.post('/api/market-research', async (req, res) => {
+	const { query, location, coords } = req.body || {};
+	if (!query) return buildError(res, 'Câmpul query este obligatoriu.', 400);
+	const coordText = coords && coords.latitude && coords.longitude ? `Lat ${coords.latitude}, Lon ${coords.longitude}` : 'fără coordonate';
+	console.log(`[market-research] query="${query}" location="${location}" ${coordText}`);
+	const prompt = `Ești un analist de piață. Query: "${query}" Locație: ${location||'nespecificat'} (${coordText}). Returnează STRICT JSON conform schemei.`;
+	if (!ai) {
+		return res.json(buildMarketFallback(query));
+	}
+	try {
+		const response = await ai.models.generateContent({
+			model: 'gemini-2.5-flash',
+			contents: prompt,
+			config: { responseMimeType: 'application/json', responseSchema: marketResearchSchema, thinkingConfig: { thinkingBudget: 0 } }
+		});
+		const text = (response.text||'').trim();
+		if (!text) {
+			console.warn('[market-research] Răspuns gol – folosesc fallback.');
+			return res.json(buildMarketFallback(query));
+		}
+		try {
+			return res.json(JSON.parse(text));
+		} catch(parseErr){
+			console.warn('[market-research] JSON invalid din AI – fallback.', parseErr);
+			return res.json(buildMarketFallback(query));
+		}
+	} catch (e) {
+		console.error('Market research AI error', e);
+		return res.json(buildMarketFallback(query));
+	}
+});
+
+app.post('/api/local-services', async (req, res) => {
+	const { category, coords } = req.body || {};
+	if (!category) return buildError(res, 'Câmpul category este obligatoriu.', 400);
+
+	// If Google Places key is available, fetch real data first (broader, more forgiving logic for always-return)
+	if (GOOGLE_PLACES_API_KEY) {
+		const debugLog = (...args) => {
+			// Minimal log noise – helps debug “rămâne pe loading” situații
+			console.log('[local-services]', ...args);
+		};
+		try {
+			let listings = [];
+			// 1. Nearby search with progressive radius expansion if user coords present
+			if (coords?.latitude && coords?.longitude) {
+				const radii = [5000, 10000, 20000, 35000];
+				for (const r of radii) {
+					const nearbyUrl = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${coords.latitude},${coords.longitude}&radius=${r}&keyword=${encodeURIComponent(category)}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
+					const nearbyResp = await fetch(nearbyUrl);
+					const nearbyJson = await nearbyResp.json();
+					debugLog('nearby radius', r, 'status', nearbyJson.status, 'results', nearbyJson.results?.length || 0);
+					listings.push(...(nearbyJson.results || []).map(p => mapPlace(p, category)));
+					if (listings.length >= 8) break; // enough local hits
+				}
+			}
+
+			// 2. If still few, run text searches across major + secondary cities (ensures content for homepage "top")
+			if (listings.length < 12) {
+				const cities = [
+					'Bucuresti','Cluj-Napoca','Timisoara','Iasi','Constanta','Brasov','Sibiu','Oradea','Craiova','Pitesti','Arad','Targu Mures'
+				];
+				for (const city of cities) {
+					const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(category + ' in ' + city + ', Romania')}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
+					const resp = await fetch(url);
+					const data = await resp.json();
+					debugLog('city search', city, 'status', data.status, 'results', (data.results||[]).length);
+					const mapped = (data.results || []).slice(0, 4).map(r => mapPlace(r, category));
+					listings.push(...mapped);
+					if (listings.length >= 40) break; // cap to avoid overload
+				}
+			}
+
+			// 3. If still empty, do a Romania-wide generic text search
+			if (listings.length === 0) {
+				const nationalUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(category + ' Romania')}&language=ro&key=${GOOGLE_PLACES_API_KEY}`;
+				const nationalResp = await fetch(nationalUrl);
+				const nationalJson = await nationalResp.json();
+				debugLog('national search status', nationalJson.status, 'results', (nationalJson.results||[]).length);
+				listings = (nationalJson.results || []).map(r => mapPlace(r, category));
+			}
+
+			// Deduplicate
+			const dedupMap = {};
+			for (const l of listings) { if (!dedupMap[l.place_id]) dedupMap[l.place_id] = l; }
+			let dedup = Object.values(dedupMap);
+
+			// Compute distance if coords provided (no hard filtering now to keep more results visible)
+			if (coords?.latitude && coords?.longitude) {
+				dedup.forEach(l => { if (l.coords) l.distance = haversineKm(coords.latitude, coords.longitude, l.coords.latitude, l.coords.longitude); });
+			}
+
+			// Sort: prioritize distance (if available) then rating then reviews
+			dedup.sort((a,b) => {
+				if (coords?.latitude && coords?.longitude) {
+					const da = a.distance ?? 1e9; const db = b.distance ?? 1e9; if (da !== db) return da - db;
+				}
+				const rdiff = (b.rating ?? 0) - (a.rating ?? 0); if (rdiff) return rdiff;
+				return (b.user_ratings_total ?? 0) - (a.user_ratings_total ?? 0);
+			});
+
+			// 4. AI enrichment OR (if still very few) AI synthetic fillers to reach a minimum
+			if (ai) {
+				try {
+					if (dedup.length < 6) {
+						// generate synthetic fillers (clearly flagged in editorial_summary)
+						const fillerPrompt = `Generează 5 afaceri plauzibile din România pentru categoria "${category}" (JSON conform schemei) cu câmp editorial_summary care începe cu '[Sugerat]'.`;
+						const resp = await ai.models.generateContent({
+							model: 'gemini-2.5-flash',
+							contents: fillerPrompt,
+							config: { responseMimeType: 'application/json', responseSchema: localServicesSchema, thinkingConfig: { thinkingBudget: 0 } }
+						});
+						const txt = (resp.text||'').trim();
+						if (txt) {
+							const json = JSON.parse(txt);
+							json.listings.forEach(l => { if (!dedupMap[l.place_id]) { dedupMap[l.place_id] = l; } });
+							dedup = Object.values(dedupMap);
+						}
+					}
+					// Short summaries for first 12 real listings without summary
+					for (const l of dedup.slice(0,12)) {
+						if (!l.editorial_summary) {
+							try {
+								const r = await ai.models.generateContent({
+									model: 'gemini-2.5-flash',
+									contents: `Frază scurtă (max 14 cuvinte) despre ${l.name} (${l.vicinity}). Ton obiectiv.` ,
+									config: { responseMimeType: 'text/plain', thinkingConfig: { thinkingBudget: 0 } }
+								});
+								l.editorial_summary = (r.text||'').trim();
+							} catch {}
+						}
+					}
+				} catch(e) { /* enrichment non-critical */ }
+			}
+
+			debugLog('final dedup listings', dedup.length);
+			return res.json({ listings: dedup });
+		} catch (e) {
+			console.error('Google Places fetch error', e);
+			// continue to AI fallback below
+		}
+	}
+
+	// AI fallback (less reliable). Constrain coordinates to Romania bounding box.
+	if (!ai) return buildError(res, 'Nu există date reale (fără Google Places) și AI indisponibil.');
+	const constraintPrompt = `Generează liste de afaceri locale reale-plauzibile în România pentru categoria "${category}".
+	Reguli stricte:
+	- Dacă se furnizează coordonate utilizator (${coords?JSON.stringify(coords):'none'}), pune primele rezultate la <25 km.
+	- Coordonatele trebuie să fie în interiorul României (lat 43.6-48.3, lon 20.2-29.7).
+	- rating între 3.5 și 5.0; user_ratings_total între 10 și 50000.
+	- Fără dubluri.
+	Output STRICT JSON conform schemei.`;
+	try {
+		const response = await ai.models.generateContent({
+			model: 'gemini-2.5-flash',
+			contents: constraintPrompt,
+			config: { responseMimeType: 'application/json', responseSchema: localServicesSchema, thinkingConfig: { thinkingBudget: 0 } }
+		});
+		const text = response.text.trim();
+		if (!text) return buildError(res, 'Răspuns gol de la AI');
+		const json = JSON.parse(text);
+		// Distance filtering client side remains, but we can discard weird far points (>400km) if user coords
+		if (coords?.latitude && coords?.longitude) {
+			json.listings = (json.listings||[]).filter(l => l.coords && withinRomania(l.coords) &&
+				haversineKm(coords.latitude, coords.longitude, l.coords.latitude, l.coords.longitude) <= 400);
+		}
+		return res.json(json);
+	} catch (e) {
+		console.error('AI fallback error', e);
+		return buildError(res, 'Eroare la generarea fallback AI.');
+	}
+});
+
+app.post('/api/google-reviews', async (req, res) => {
+	if (!ai) return buildError(res, 'AI indisponibil (cheie lipsă).');
+	const { name, vicinity } = req.body || {};
+	if (!name || !vicinity) return buildError(res, 'name și vicinity obligatorii.', 400);
+	const prompt = `Extrage până la 5 recenzii reprezentative (nume autor, text în română, rating numeric) pentru afacerea "${name}" la adresa "${vicinity}". STRICT JSON.`;
+	try {
+		const response = await ai.models.generateContent({
+			model: 'gemini-2.5-flash',
+			contents: prompt,
+			config: { responseMimeType: 'application/json', responseSchema: googleReviewsSchema, thinkingConfig: { thinkingBudget: 0 } }
+		});
+		const text = response.text.trim();
+		if (!text) return buildError(res, 'Răspuns gol de la AI');
+		return res.json(JSON.parse(text));
+	} catch (e) {
+		console.error('Google reviews AI error', e);
+		return buildError(res, 'Eroare AI la generarea recenziilor.');
+	}
+});
+
+// Servire frontend (build Vite) dacă există dist/ (pentru VPS un singur proces)
+const distDir = path.join(__dirname, 'dist');
+if (fs.existsSync(distDir)) {
+	app.use(express.static(distDir));
+	app.get('*', (req, res) => {
+		if (req.path.startsWith('/api/')) {
+			return buildError(res, 'Endpoint inexistent.', 404);
+		}
+		return res.sendFile(path.join(distDir, 'index.html'));
+	});
+} else {
+	console.warn('[STATIC] Folder dist/ lipsește – rulează `npm run build` pentru producție.');
+}
+
+const port = process.env.PORT || 5175;
+app.listen(port, () => {
+	console.log(`API server running on http://localhost:${port}`);
+});
+
+function mapPlace(r, category){
+	return {
+		place_id: r.place_id || `${r.name}-${r.formatted_address}`,
+		name: r.name,
+		category,
+		vicinity: r.vicinity || r.formatted_address || '',
+		rating: r.rating ?? null,
+		user_ratings_total: r.user_ratings_total ?? null,
+		coords: r.geometry?.location ? { latitude: r.geometry.location.lat, longitude: r.geometry.location.lng } : null,
+		url: '',
+		website: '',
+		phone_number: '',
+		opening_hours: r.opening_hours?.open_now != null ? (r.opening_hours.open_now ? 'Deschis acum' : 'Închis') : '',
+		detailed_opening_hours: [],
+		business_status: r.business_status,
+		price_level: r.price_level ?? null,
+		editorial_summary: ''
+	};
+}
+
+function haversineKm(lat1, lon1, lat2, lon2){
+	const R=6371; const toRad = d=>d*Math.PI/180; const dLat=toRad(lat2-lat1); const dLon=toRad(lon2-lon1); const a=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2; return 2*R*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+function withinRomania(c){
+	return c.latitude>=43.6 && c.latitude<=48.3 && c.longitude>=20.2 && c.longitude<=29.7;
+}
