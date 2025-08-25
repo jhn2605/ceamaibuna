@@ -1,3 +1,29 @@
+// --- Scraper modular pentru prețuri reale ---
+import path from 'path';
+import { fileURLToPath } from 'url';
+const scraperPath = path.join(__dirname, 'scrapers', 'index.js');
+let getRealPrices;
+try {
+	({ getRealPrices } = await import(scraperPath));
+} catch (e) {
+	getRealPrices = null;
+	console.warn('Scraper module not found or failed to load:', e);
+}
+
+app.post('/api/real-prices', async (req, res) => {
+	const { query } = req.body || {};
+	if (!query) return buildError(res, 'Câmpul query este obligatoriu.', 400);
+	if (!getRealPrices) return buildError(res, 'Scraper module indisponibil.', 500);
+	try {
+		const prices = await getRealPrices(query);
+		if (!prices || prices.length === 0) {
+			return res.json({ prices: [], message: 'Nu s-au găsit prețuri reale pentru acest produs.' });
+		}
+		return res.json({ prices });
+	} catch (e) {
+		return buildError(res, 'Eroare la extragerea prețurilor reale.');
+	}
+});
 import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -98,7 +124,18 @@ app.post('/api/market-research', async (req, res) => {
 	if (!query) return buildError(res, 'Câmpul query este obligatoriu.', 400);
 	const coordText = coords && coords.latitude && coords.longitude ? `Lat ${coords.latitude}, Lon ${coords.longitude}` : 'fără coordonate';
 	console.log(`[market-research] query="${query}" location="${location}" ${coordText}`);
-	const prompt = `Ești un analist de piață. Query: "${query}" Locație: ${location||'nespecificat'} (${coordText}). Returnează STRICT JSON conform schemei.`;
+	const prompt = `Ești un analist de piață profesionist. Realizează un studiu de piață complet pentru: "${query}" în zona ${location||'nespecificat'} (${coordText}).
+
+Reguli stricte și obligatorii:
+- Include minim 7 produse/branduri REALE, fiecare cu sumar, avantaje, dezavantaje, prețuri de la minim 3 magazine DIFERITE din România (ex: eMAG, Altex, PC Garage, Flanco, Dedeman, Carrefour, Auchan, evoMAG, Cel.ro, Media Galaxy, etc).
+- PREȚURILE TREBUIE SĂ FIE REALE, ACTUALE (2025) și să existe pe site-urile magazinelor românești. NU folosi estimări, nu inventa prețuri, nu folosi surse internaționale.
+- Pentru fiecare produs, menționează magazinele, prețul exact și dacă este promoție sau preț standard.
+- NU include produse speculative, nelansate sau care nu există pe piața reală din România.
+- Nu repeta aceleași magazine la toate produsele, diversifică sursele cât mai mult.
+- La final, adaugă o scurtă analiză a trendurilor de preț, recomandări și ce branduri sunt cele mai populare.
+- Nu inventa magazine care nu există în România.
+- Returnează STRICT JSON conform schemei date (fără text suplimentar, fără explicații, fără text liber).
+`;
 	if (!ai) {
 		return res.json(buildMarketFallback(query));
 	}
