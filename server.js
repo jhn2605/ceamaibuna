@@ -1,6 +1,7 @@
 // --- Scraper modular pentru prețuri reale ---
-import path from 'path';
+
 import { fileURLToPath } from 'url';
+import path from 'path';
 const scraperPath = path.join(__dirname, 'scrapers', 'index.js');
 let getRealPrices;
 try {
@@ -24,14 +25,13 @@ app.post('/api/real-prices', async (req, res) => {
 		return buildError(res, 'Eroare la extragerea prețurilor reale.');
 	}
 });
+
 import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import fetch from 'node-fetch';
-import path from 'path';
-import { fileURLToPath } from 'url';
 
 // ESM equivalent pentru __dirname
 const __filename = fileURLToPath(import.meta.url);
